@@ -1,6 +1,14 @@
 #include <zephyr/device.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #define CAN_ID_STANDARD_MASK    (0x7FFU)
 #define CAN_ID_EXTENDED_MASK    (0x1FFFFFFFU)
@@ -13,21 +21,391 @@
 extern int rcar_canfd_send(const struct device *dev, int ch, uint32_t id, const uint8_t *data, uint8_t len);
 extern int rcar_canfd_poll_recv(const struct device *dev, int ch, uint32_t *id, uint8_t *len, uint8_t *data);
 
-int main(void)
+#define CAN_CH_MIN 3
+#define CAN_CH_MAX 4
+
+#define CAN_ID_VEHICLE_STATUS_1 1001U
+#define CAN_ID_VEHICLE_STATUS_2 985U
+#define CAN_ID_VEHICLE_STATUS_3 986U
+#define CAN_ID_EV_POWERTRAIN    180U
+#define CAN_ID_ESP              184U
+#define CAN_ID_EPS_STATUS       192U
+#define CAN_ID_BCM_STATUS_1     142U
+
+#define SPEED_FULL_KMH      200U
+#define ENGINE_FULL_RPM     8000U
+#define PULSE_WINDOW_MS     100U
+#define PULSE_MIN_PERIOD_MS 4U
+#define PULSE_HIGH_MS       3U
+#define PULSE_TICK_MS       1U
+#define PULSE_MAX_COUNT     (PULSE_WINDOW_MS / PULSE_MIN_PERIOD_MS)
+#define DEBUG_PRINT_MS      1000U
+
+BUILD_ASSERT((PULSE_WINDOW_MS % PULSE_MIN_PERIOD_MS) == 0U);
+BUILD_ASSERT(PULSE_HIGH_MS < PULSE_MIN_PERIOD_MS);
+
+enum led_index {
+    LED_FAULT_PRESENT,
+    LED_A,
+    LED_B,
+    LED_C,
+    LED_D,
+    LED_COUNT,
+};
+
+struct vehicle_state {
+    uint32_t speed_kmh;
+    uint32_t engine_rpm;
+    uint8_t shift_position;
+    bool left_turn;
+    bool right_turn;
+    bool eps_fault;
+    bool abs_fault;
+    bool motor_fault;
+    bool left_seat_belt_fastened;
+    bool right_seat_belt_fastened;
+};
+
+struct pulse_output {
+    enum led_index pin;
+    uint8_t count;
+    uint8_t emitted;
+    uint32_t current_ms;
+    bool on;
+};
+
+struct debug_stats {
+    uint32_t rx_total;
+    uint32_t rx_decoded;
+    uint32_t rx_bad_len;
+    uint32_t rx_unknown;
+    uint32_t last_id;
+    uint8_t last_ch;
+    uint8_t last_len;
+};
+
+static const struct device *canfd = DEVICE_DT_GET(DT_NODELABEL(canfd));
+static struct vehicle_state state = {
+    .left_seat_belt_fastened = true,
+    .right_seat_belt_fastened = true,
+};
+static struct debug_stats debug_stats;
+static bool led_output_state[LED_COUNT];
+K_MUTEX_DEFINE(state_lock);
+K_SEM_DEFINE(app_ready, 0, 2);
+
+#define CONNECTOR_NODE DT_NODELABEL(connector)
+
+#define GPIO_DT_SPEC_GET_CHILD(node_id) GPIO_DT_SPEC_GET(node_id, gpios)
+
+static struct gpio_dt_spec pins[] = {
+    DT_FOREACH_CHILD_STATUS_OKAY_SEP(CONNECTOR_NODE, GPIO_DT_SPEC_GET_CHILD, (,))
+};
+
+BUILD_ASSERT(ARRAY_SIZE(pins) == LED_COUNT);
+
+static const char *const led_names[] = {
+    "FAULT_PRESENT",
+    "A",
+    "B",
+    "C",
+    "D",
+};
+
+BUILD_ASSERT(ARRAY_SIZE(led_names) == LED_COUNT);
+
+int init_condition_check(void)
 {
-    printk("Hello from can_echoback sample\n");
-    const struct device *canfd = DEVICE_DT_GET(DT_NODELABEL(canfd));
     if (!device_is_ready(canfd)) {
         printk("canfd not ready\n");
-        return 0;
+        return -1;
     }
 
+    for (size_t i = 0; i < ARRAY_SIZE(pins); ++i) {
+        int ret;
+
+        if (!gpio_is_ready_dt(&pins[i])) {
+            printk("GPIO%u not ready\n", (uint32_t)i);
+            return -1;
+        }
+
+        ret = gpio_pin_configure_dt(&pins[i], GPIO_OUTPUT_INACTIVE);
+        if (ret != 0) {
+            printk("GPIO%u configure failed: %d\n", (uint32_t)i, ret);
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static uint32_t can_id_without_flags(uint32_t id)
+{
+    uint32_t id_flags = id & CAN_ID_TYPE_MASK;
+
+    if ((id_flags == CAN_ID_TYPE_STANDARD) || (id_flags == CAN_ID_TYPE_FD_STANDARD)) {
+        return id & CAN_ID_STANDARD_MASK;
+    }
+
+    return id & CAN_ID_EXTENDED_MASK;
+}
+
+static bool bit_is_set(const uint8_t *data, size_t len, size_t byte, uint8_t bit)
+{
+    if (byte >= len) {
+        return false;
+    }
+
+    return ((data[byte] >> bit) & 0x1U) != 0U;
+}
+
+static bool decode_can_frame(uint32_t raw_id, const uint8_t *data, uint8_t len)
+{
+    uint32_t id = can_id_without_flags(raw_id);
+    bool decoded = true;
+
+    if (len != 8U) {
+        k_mutex_lock(&state_lock, K_FOREVER);
+        debug_stats.rx_bad_len++;
+        k_mutex_unlock(&state_lock);
+        return false;
+    }
+
+    k_mutex_lock(&state_lock, K_FOREVER);
+
+    switch (id) {
+    case CAN_ID_VEHICLE_STATUS_1:
+        state.speed_kmh = ((data[0] * 128U) + ((data[1] / 2U) & 0x7FU)) / 64U;
+        break;
+    case CAN_ID_VEHICLE_STATUS_2:
+        state.engine_rpm = ((data[2] * 256U) + data[3]) / 4U;
+        break;
+    case CAN_ID_VEHICLE_STATUS_3:
+        state.left_turn = bit_is_set(data, len, 0, 1);
+        state.right_turn = bit_is_set(data, len, 0, 2);
+        break;
+    case CAN_ID_EV_POWERTRAIN:
+        state.motor_fault = bit_is_set(data, len, 0, 1);
+        state.shift_position = (data[1] >> 2) & 0x07U;
+        break;
+    case CAN_ID_ESP:
+        state.abs_fault = bit_is_set(data, len, 3, 3);
+        break;
+    case CAN_ID_EPS_STATUS:
+        state.eps_fault = bit_is_set(data, len, 0, 6);
+        break;
+    case CAN_ID_BCM_STATUS_1:
+        state.left_seat_belt_fastened = bit_is_set(data, len, 1, 4);
+        state.right_seat_belt_fastened = bit_is_set(data, len, 1, 5);
+        break;
+    default:
+        decoded = false;
+        debug_stats.rx_unknown++;
+        break;
+    }
+
+    if (decoded) {
+        debug_stats.rx_decoded++;
+    }
+
+    k_mutex_unlock(&state_lock);
+
+    return decoded;
+}
+
+static uint8_t pulse_count_from_value(uint32_t value, uint32_t full_scale)
+{
+    uint32_t count = (value * PULSE_MAX_COUNT) / full_scale;
+
+    if (count > PULSE_MAX_COUNT) {
+        return PULSE_MAX_COUNT;
+    }
+
+    return count;
+}
+
+static void pulse_output_start_window(struct pulse_output *pulse, uint8_t count)
+{
+    pulse->count = count;
+    pulse->emitted = 0U;
+    pulse->current_ms = 0U;
+    pulse->on = false;
+}
+
+static uint32_t pulse_output_next_low_ms(const struct pulse_output *pulse)
+{
+    uint32_t next_on_ms;
+
+    if (pulse->emitted >= pulse->count) {
+        return 0U;
+    }
+
+    next_on_ms = ((uint32_t)pulse->emitted * PULSE_WINDOW_MS) / pulse->count;
+    if (next_on_ms <= pulse->current_ms) {
+        return PULSE_TICK_MS;
+    }
+
+    return next_on_ms - pulse->current_ms;
+}
+
+static void led_set_raw(enum led_index pin, bool on)
+{
+    (void)gpio_pin_set_dt(&pins[pin], on ? 1 : 0);
+    led_output_state[pin] = on;
+}
+
+static void led_set_logged(enum led_index pin, bool on, const char *reason)
+{
+    if (led_output_state[pin] != on) {
+        printk("led: %s=%u (%s)\n", led_names[pin], on, reason);
+    }
+
+    led_set_raw(pin, on);
+}
+
+static void led_toggle_logged(enum led_index pin, const char *reason)
+{
+    led_set_logged(pin, !led_output_state[pin], reason);
+}
+
+static struct pulse_output speed_pulse = {
+    .pin = LED_C,
+};
+static struct pulse_output engine_pulse = {
+    .pin = LED_D,
+};
+
+static void pulse_output_step(struct pulse_output *pulse, struct k_timer *timer)
+{
+    if ((pulse->count == 0U) || (!pulse->on && (pulse->emitted >= pulse->count))) {
+        led_set_raw(pulse->pin, false);
+        return;
+    }
+
+    if (!pulse->on) {
+        pulse->on = true;
+        pulse->emitted++;
+        led_set_raw(pulse->pin, true);
+        k_timer_start(timer, K_MSEC(PULSE_HIGH_MS), K_NO_WAIT);
+        return;
+    }
+
+    pulse->on = false;
+    pulse->current_ms += PULSE_HIGH_MS;
+    led_set_raw(pulse->pin, false);
+
+    if (pulse->emitted < pulse->count) {
+        uint32_t low_ms = pulse_output_next_low_ms(pulse);
+
+        pulse->current_ms += low_ms;
+        k_timer_start(timer, K_MSEC(low_ms), K_NO_WAIT);
+    }
+}
+
+static void speed_pulse_timer_handler(struct k_timer *timer)
+{
+    pulse_output_step(&speed_pulse, timer);
+}
+
+static void engine_pulse_timer_handler(struct k_timer *timer)
+{
+    pulse_output_step(&engine_pulse, timer);
+}
+
+K_TIMER_DEFINE(speed_pulse_timer, speed_pulse_timer_handler, NULL);
+K_TIMER_DEFINE(engine_pulse_timer, engine_pulse_timer_handler, NULL);
+
+static void pulse_output_stop(struct pulse_output *pulse, struct k_timer *timer, const char *reason)
+{
+    k_timer_stop(timer);
+    pulse_output_start_window(pulse, 0U);
+    led_set_logged(pulse->pin, false, reason);
+}
+
+static void pulse_output_start(struct pulse_output *pulse, struct k_timer *timer,
+                               uint8_t count)
+{
+    k_timer_stop(timer);
+    pulse_output_start_window(pulse, count);
+    led_set_raw(pulse->pin, false);
+
+    if (count > 0U) {
+        k_timer_start(timer, K_NO_WAIT, K_NO_WAIT);
+    }
+}
+
+static void led_task(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+
+    k_sem_take(&app_ready, K_FOREVER);
+
+    for (;;) {
+        struct vehicle_state snapshot;
+        bool seat_belt_open;
+        bool diagnostic_active;
+        bool turn_active;
+
+        k_mutex_lock(&state_lock, K_FOREVER);
+        snapshot = state;
+        k_mutex_unlock(&state_lock);
+
+        seat_belt_open =
+            !snapshot.left_seat_belt_fastened || !snapshot.right_seat_belt_fastened;
+        diagnostic_active = snapshot.eps_fault || snapshot.abs_fault ||
+                    snapshot.motor_fault || seat_belt_open;
+        turn_active = snapshot.left_turn || snapshot.right_turn;
+
+        led_set_logged(LED_FAULT_PRESENT, diagnostic_active, "fault-present");
+
+        if (diagnostic_active) {
+            /* led1..led4 encode EPS, ABS, motor, and seat-belt diagnostics. */
+            led_set_logged(LED_A, snapshot.eps_fault, "eps-fault");
+            led_set_logged(LED_B, snapshot.abs_fault, "abs-fault");
+            pulse_output_stop(&speed_pulse, &speed_pulse_timer, "diagnostic-mode");
+            pulse_output_stop(&engine_pulse, &engine_pulse_timer, "diagnostic-mode");
+            led_set_logged(LED_C, snapshot.motor_fault, "motor-fault");
+            led_set_logged(LED_D, seat_belt_open, "seat-belt-open");
+        } else if (turn_active) {
+            pulse_output_stop(&speed_pulse, &speed_pulse_timer, "turn-mode");
+            pulse_output_stop(&engine_pulse, &engine_pulse_timer, "turn-mode");
+            led_set_logged(LED_A, snapshot.left_turn, "left-turn");
+            led_set_logged(LED_B, snapshot.right_turn, "right-turn");
+        } else {
+            uint8_t speed_count = pulse_count_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
+            uint8_t engine_count = pulse_count_from_value(snapshot.engine_rpm,
+                                  ENGINE_FULL_RPM);
+
+            pulse_output_start(&speed_pulse, &speed_pulse_timer, speed_count);
+            pulse_output_start(&engine_pulse, &engine_pulse_timer, engine_count);
+
+            led_set_logged(LED_A, snapshot.left_turn, "left-turn");
+            led_set_logged(LED_B, snapshot.right_turn, "right-turn");
+        }
+
+        k_sleep(K_MSEC(PULSE_WINDOW_MS));
+    }
+}
+
+static void can_rx_task(void *arg1, void *arg2, void *arg3)
+{
     uint8_t tx[64] = {0};
     uint8_t rx[64];
     uint32_t id, id_flags, id_without_flags;
     uint8_t len = 8;
     uint32_t cnt = 1;
     volatile uint32_t dummy;
+
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+    ARG_UNUSED(id_flags);
+    ARG_UNUSED(id_without_flags);
+
+    printk("start can_rx_task\n");
+
+    k_sem_take(&app_ready, K_FOREVER);
 
     tx[0] = 0xff;
     rcar_canfd_send(canfd, 3, 0x123 | CAN_ID_TYPE_FD_EXTENDED, tx, 8);
@@ -41,6 +419,16 @@ int main(void)
                 printk("\n");
                 */
 
+                k_mutex_lock(&state_lock, K_FOREVER);
+                debug_stats.rx_total++;
+                debug_stats.last_ch = ch;
+                debug_stats.last_id = can_id_without_flags(id);
+                debug_stats.last_len = len;
+                k_mutex_unlock(&state_lock);
+
+                (void)decode_can_frame(id, rx, len);
+
+#if 0
                 // echo back
                 id_flags = id & CAN_ID_TYPE_MASK;
                 if ( (id_flags == CAN_ID_TYPE_STANDARD) || (id_flags == CAN_ID_TYPE_FD_STANDARD) ) { // Standard ID
@@ -54,7 +442,72 @@ int main(void)
                     tx[i] = rx[i] + 1;
                 }
                 rcar_canfd_send(canfd, ch, (id_flags | id_without_flags), tx, len);
+#endif
             }
         }
+
+        k_sleep(K_MSEC(1));
+    }
+}
+
+static void print_debug_status(struct debug_stats *prev)
+{
+    struct vehicle_state snapshot;
+    struct debug_stats stats;
+    bool seat_belt_open;
+    bool diagnostic_active;
+    uint8_t speed_count;
+    uint8_t engine_count;
+
+    k_mutex_lock(&state_lock, K_FOREVER);
+    snapshot = state;
+    stats = debug_stats;
+    k_mutex_unlock(&state_lock);
+
+    seat_belt_open =
+        !snapshot.left_seat_belt_fastened || !snapshot.right_seat_belt_fastened;
+    diagnostic_active = snapshot.eps_fault || snapshot.abs_fault ||
+                snapshot.motor_fault || seat_belt_open;
+    speed_count = pulse_count_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
+    engine_count = pulse_count_from_value(snapshot.engine_rpm, ENGINE_FULL_RPM);
+
+    printk("state: rx=%u(+%u) decoded=%u(+%u) unknown=%u bad_len=%u "
+           "last=ch%u id=%u len=%u\n",
+           stats.rx_total, stats.rx_total - prev->rx_total,
+           stats.rx_decoded, stats.rx_decoded - prev->rx_decoded,
+           stats.rx_unknown, stats.rx_bad_len,
+           stats.last_ch, stats.last_id, stats.last_len);
+    printk("state: speed=%ukm/h(count=%u) engine=%urpm(count=%u) "
+           "turn=L%u/R%u shift=%u fault=%u eps=%u abs=%u motor=%u belt_open=%u\n",
+           snapshot.speed_kmh, speed_count,
+           snapshot.engine_rpm, engine_count,
+           snapshot.left_turn, snapshot.right_turn,
+           snapshot.shift_position, diagnostic_active,
+           snapshot.eps_fault, snapshot.abs_fault,
+           snapshot.motor_fault, seat_belt_open);
+
+    *prev = stats;
+}
+
+K_THREAD_DEFINE(led_tid, 2048, led_task, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(can_rx_tid, 2048, can_rx_task, NULL, NULL, NULL, 5, 0, 0);
+
+int main(void)
+{
+    struct debug_stats prev = {0};
+
+    if (init_condition_check()) {
+        printk("Invalid condition\n");
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < 2U; ++i) {
+        k_sem_give(&app_ready);
+    }
+
+    for (;;) {
+        k_sleep(K_MSEC(DEBUG_PRINT_MS));
+        print_debug_status(&prev);
+        //led_toggle_logged(LED_B, "debug-toggle");
     }
 }
