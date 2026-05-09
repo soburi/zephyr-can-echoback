@@ -34,15 +34,15 @@ extern int rcar_canfd_poll_recv(const struct device *dev, int ch, uint32_t *id, 
 
 #define SPEED_FULL_KMH      200U
 #define ENGINE_FULL_RPM     8000U
-#define PULSE_WINDOW_MS     100U
-#define PULSE_MIN_PERIOD_MS 4U
-#define PULSE_HIGH_MS       3U
-#define PULSE_TICK_MS       1U
-#define PULSE_MAX_COUNT     (PULSE_WINDOW_MS / PULSE_MIN_PERIOD_MS)
+#define PULSE_MIN_FREQ_HZ   100U
+#define PULSE_MAX_FREQ_HZ   150U
+#define PULSE_LOW_US        200U
+#define PULSE_USEC_PER_SEC  1000000U
+#define OUTPUT_UPDATE_MS    1U
 #define DEBUG_PRINT_MS      1000U
 
-BUILD_ASSERT((PULSE_WINDOW_MS % PULSE_MIN_PERIOD_MS) == 0U);
-BUILD_ASSERT(PULSE_HIGH_MS < PULSE_MIN_PERIOD_MS);
+BUILD_ASSERT(PULSE_MAX_FREQ_HZ > PULSE_MIN_FREQ_HZ);
+BUILD_ASSERT(PULSE_LOW_US < (PULSE_USEC_PER_SEC / PULSE_MAX_FREQ_HZ));
 
 enum led_index {
     LED_FAULT_PRESENT,
@@ -67,11 +67,11 @@ struct vehicle_state {
 };
 
 struct pulse_output {
+    const char *name;
     enum led_index pin;
-    uint8_t count;
-    uint8_t emitted;
-    uint32_t current_ms;
+    uint32_t high_us;
     bool on;
+    bool enabled;
 };
 
 struct debug_stats {
@@ -134,6 +134,9 @@ int init_condition_check(void)
             printk("GPIO%u configure failed: %d\n", (uint32_t)i, ret);
             return ret;
         }
+
+        printk("led: %s -> %s pin %u\n", led_names[i],
+               pins[i].port->name, pins[i].pin);
     }
     return 0;
 }
@@ -174,7 +177,7 @@ static bool decode_can_frame(uint32_t raw_id, const uint8_t *data, uint8_t len)
 
     switch (id) {
     case CAN_ID_VEHICLE_STATUS_1:
-        state.speed_kmh = ((data[0] * 128U) + ((data[1] / 2U) & 0x7FU)) / 64U;
+        state.speed_kmh = (((uint16_t)data[0] << 7) | (data[1] >> 1)) / 64U;
         break;
     case CAN_ID_VEHICLE_STATUS_2:
         state.engine_rpm = ((data[2] * 256U) + data[3]) / 4U;
@@ -212,39 +215,29 @@ static bool decode_can_frame(uint32_t raw_id, const uint8_t *data, uint8_t len)
     return decoded;
 }
 
-static uint8_t pulse_count_from_value(uint32_t value, uint32_t full_scale)
+static uint8_t pulse_percent_from_value(uint32_t value, uint32_t full_scale)
 {
-    uint32_t count = (value * PULSE_MAX_COUNT) / full_scale;
+    uint32_t percent = (value * 100U) / full_scale;
 
-    if (count > PULSE_MAX_COUNT) {
-        return PULSE_MAX_COUNT;
+    if (percent > 100U) {
+        return 100U;
     }
 
-    return count;
+    return percent;
 }
 
-static void pulse_output_start_window(struct pulse_output *pulse, uint8_t count)
+static uint32_t pulse_frequency_from_percent(uint8_t percent)
 {
-    pulse->count = count;
-    pulse->emitted = 0U;
-    pulse->current_ms = 0U;
-    pulse->on = false;
+    return PULSE_MIN_FREQ_HZ +
+           (((PULSE_MAX_FREQ_HZ - PULSE_MIN_FREQ_HZ) * percent) / 100U);
 }
 
-static uint32_t pulse_output_next_low_ms(const struct pulse_output *pulse)
+static uint32_t pulse_high_us_from_percent(uint8_t percent)
 {
-    uint32_t next_on_ms;
+    uint32_t frequency_hz = pulse_frequency_from_percent(percent);
+    uint32_t period_us = PULSE_USEC_PER_SEC / frequency_hz;
 
-    if (pulse->emitted >= pulse->count) {
-        return 0U;
-    }
-
-    next_on_ms = ((uint32_t)pulse->emitted * PULSE_WINDOW_MS) / pulse->count;
-    if (next_on_ms <= pulse->current_ms) {
-        return PULSE_TICK_MS;
-    }
-
-    return next_on_ms - pulse->current_ms;
+    return period_us - PULSE_LOW_US;
 }
 
 static void led_set_raw(enum led_index pin, bool on)
@@ -268,37 +261,31 @@ static void led_toggle_logged(enum led_index pin, const char *reason)
 }
 
 static struct pulse_output speed_pulse = {
+    .name = "speed",
     .pin = LED_C,
 };
 static struct pulse_output engine_pulse = {
+    .name = "engine",
     .pin = LED_D,
 };
 
 static void pulse_output_step(struct pulse_output *pulse, struct k_timer *timer)
 {
-    if ((pulse->count == 0U) || (!pulse->on && (pulse->emitted >= pulse->count))) {
+    if (!pulse->enabled) {
         led_set_raw(pulse->pin, false);
         return;
     }
 
     if (!pulse->on) {
         pulse->on = true;
-        pulse->emitted++;
         led_set_raw(pulse->pin, true);
-        k_timer_start(timer, K_MSEC(PULSE_HIGH_MS), K_NO_WAIT);
+        k_timer_start(timer, K_USEC(pulse->high_us), K_NO_WAIT);
         return;
     }
 
     pulse->on = false;
-    pulse->current_ms += PULSE_HIGH_MS;
     led_set_raw(pulse->pin, false);
-
-    if (pulse->emitted < pulse->count) {
-        uint32_t low_ms = pulse_output_next_low_ms(pulse);
-
-        pulse->current_ms += low_ms;
-        k_timer_start(timer, K_MSEC(low_ms), K_NO_WAIT);
-    }
+    k_timer_start(timer, K_USEC(PULSE_LOW_US), K_NO_WAIT);
 }
 
 static void speed_pulse_timer_handler(struct k_timer *timer)
@@ -317,20 +304,28 @@ K_TIMER_DEFINE(engine_pulse_timer, engine_pulse_timer_handler, NULL);
 static void pulse_output_stop(struct pulse_output *pulse, struct k_timer *timer, const char *reason)
 {
     k_timer_stop(timer);
-    pulse_output_start_window(pulse, 0U);
+    pulse->high_us = 0U;
+    pulse->on = false;
+    pulse->enabled = false;
     led_set_logged(pulse->pin, false, reason);
 }
 
-static void pulse_output_start(struct pulse_output *pulse, struct k_timer *timer,
-                               uint8_t count)
+static void pulse_output_set_percent(struct pulse_output *pulse, struct k_timer *timer,
+                                     uint8_t percent)
 {
-    k_timer_stop(timer);
-    pulse_output_start_window(pulse, count);
-    led_set_raw(pulse->pin, false);
+    uint32_t high_us = pulse_high_us_from_percent(percent);
 
-    if (count > 0U) {
-        k_timer_start(timer, K_NO_WAIT, K_NO_WAIT);
+    if (pulse->enabled && (pulse->high_us == high_us)) {
+        return;
     }
+
+    pulse->high_us = high_us;
+    pulse->on = false;
+    pulse->enabled = true;
+    printk("pwm: %s pin=%s percent=%u high_us=%u low_us=%u\n",
+           pulse->name, led_names[pulse->pin], percent, high_us, PULSE_LOW_US);
+    led_set_raw(pulse->pin, false);
+    k_timer_start(timer, K_NO_WAIT, K_NO_WAIT);
 }
 
 static void led_task(void *arg1, void *arg2, void *arg3)
@@ -373,18 +368,19 @@ static void led_task(void *arg1, void *arg2, void *arg3)
             led_set_logged(LED_A, snapshot.left_turn, "left-turn");
             led_set_logged(LED_B, snapshot.right_turn, "right-turn");
         } else {
-            uint8_t speed_count = pulse_count_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
-            uint8_t engine_count = pulse_count_from_value(snapshot.engine_rpm,
-                                  ENGINE_FULL_RPM);
+            uint8_t speed_percent = pulse_percent_from_value(snapshot.speed_kmh,
+                                    SPEED_FULL_KMH);
+            uint8_t engine_percent = pulse_percent_from_value(snapshot.engine_rpm,
+                                     ENGINE_FULL_RPM);
 
-            pulse_output_start(&speed_pulse, &speed_pulse_timer, speed_count);
-            pulse_output_start(&engine_pulse, &engine_pulse_timer, engine_count);
+            pulse_output_set_percent(&speed_pulse, &speed_pulse_timer, speed_percent);
+            pulse_output_set_percent(&engine_pulse, &engine_pulse_timer, engine_percent);
 
             led_set_logged(LED_A, snapshot.left_turn, "left-turn");
             led_set_logged(LED_B, snapshot.right_turn, "right-turn");
         }
 
-        k_sleep(K_MSEC(PULSE_WINDOW_MS));
+        k_sleep(K_MSEC(OUTPUT_UPDATE_MS));
     }
 }
 
@@ -456,8 +452,8 @@ static void print_debug_status(struct debug_stats *prev)
     struct debug_stats stats;
     bool seat_belt_open;
     bool diagnostic_active;
-    uint8_t speed_count;
-    uint8_t engine_count;
+    uint8_t speed_percent;
+    uint8_t engine_percent;
 
     k_mutex_lock(&state_lock, K_FOREVER);
     snapshot = state;
@@ -468,8 +464,8 @@ static void print_debug_status(struct debug_stats *prev)
         !snapshot.left_seat_belt_fastened || !snapshot.right_seat_belt_fastened;
     diagnostic_active = snapshot.eps_fault || snapshot.abs_fault ||
                 snapshot.motor_fault || seat_belt_open;
-    speed_count = pulse_count_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
-    engine_count = pulse_count_from_value(snapshot.engine_rpm, ENGINE_FULL_RPM);
+    speed_percent = pulse_percent_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
+    engine_percent = pulse_percent_from_value(snapshot.engine_rpm, ENGINE_FULL_RPM);
 
     printk("state: rx=%u(+%u) decoded=%u(+%u) unknown=%u bad_len=%u "
            "last=ch%u id=%u len=%u\n",
@@ -477,10 +473,10 @@ static void print_debug_status(struct debug_stats *prev)
            stats.rx_decoded, stats.rx_decoded - prev->rx_decoded,
            stats.rx_unknown, stats.rx_bad_len,
            stats.last_ch, stats.last_id, stats.last_len);
-    printk("state: speed=%ukm/h(count=%u) engine=%urpm(count=%u) "
+    printk("state: speed=%ukm/h(%u%%/%uHz) engine=%urpm(%u%%/%uHz) "
            "turn=L%u/R%u shift=%u fault=%u eps=%u abs=%u motor=%u belt_open=%u\n",
-           snapshot.speed_kmh, speed_count,
-           snapshot.engine_rpm, engine_count,
+           snapshot.speed_kmh, speed_percent, pulse_frequency_from_percent(speed_percent),
+           snapshot.engine_rpm, engine_percent, pulse_frequency_from_percent(engine_percent),
            snapshot.left_turn, snapshot.right_turn,
            snapshot.shift_position, diagnostic_active,
            snapshot.eps_fault, snapshot.abs_fault,
