@@ -40,6 +40,8 @@ extern int rcar_canfd_poll_recv(const struct device *dev, int ch, uint32_t *id, 
 #define PULSE_USEC_PER_SEC  1000000U
 #define OUTPUT_UPDATE_MS    1U
 #define DEBUG_PRINT_MS      1000U
+#define ANSI_HOME           "\x1b[H"
+#define ANSI_CLEAR_EOL      "\x1b[K"
 
 BUILD_ASSERT(PULSE_MAX_FREQ_HZ > PULSE_MIN_FREQ_HZ);
 BUILD_ASSERT(PULSE_LOW_US < (PULSE_USEC_PER_SEC / PULSE_MAX_FREQ_HZ));
@@ -82,6 +84,7 @@ struct debug_stats {
     uint32_t last_id;
     uint8_t last_ch;
     uint8_t last_len;
+    uint8_t last_data[8];
 };
 
 static const struct device *canfd = DEVICE_DT_GET(DT_NODELABEL(canfd));
@@ -134,9 +137,6 @@ int init_condition_check(void)
             printk("GPIO%u configure failed: %d\n", (uint32_t)i, ret);
             return ret;
         }
-
-        printk("led: %s -> %s pin %u\n", led_names[i],
-               pins[i].port->name, pins[i].pin);
     }
     return 0;
 }
@@ -248,9 +248,7 @@ static void led_set_raw(enum led_index pin, bool on)
 
 static void led_set_logged(enum led_index pin, bool on, const char *reason)
 {
-    if (led_output_state[pin] != on) {
-        printk("led: %s=%u (%s)\n", led_names[pin], on, reason);
-    }
+    ARG_UNUSED(reason);
 
     led_set_raw(pin, on);
 }
@@ -322,8 +320,6 @@ static void pulse_output_set_percent(struct pulse_output *pulse, struct k_timer 
     pulse->high_us = high_us;
     pulse->on = false;
     pulse->enabled = true;
-    printk("pwm: %s pin=%s percent=%u high_us=%u low_us=%u\n",
-           pulse->name, led_names[pulse->pin], percent, high_us, PULSE_LOW_US);
     led_set_raw(pulse->pin, false);
     k_timer_start(timer, K_NO_WAIT, K_NO_WAIT);
 }
@@ -420,6 +416,9 @@ static void can_rx_task(void *arg1, void *arg2, void *arg3)
                 debug_stats.last_ch = ch;
                 debug_stats.last_id = can_id_without_flags(id);
                 debug_stats.last_len = len;
+                for (uint8_t i = 0U; (i < len) && (i < ARRAY_SIZE(debug_stats.last_data)); ++i) {
+                    debug_stats.last_data[i] = rx[i];
+                }
                 k_mutex_unlock(&state_lock);
 
                 (void)decode_can_frame(id, rx, len);
@@ -451,9 +450,9 @@ static void print_debug_status(struct debug_stats *prev)
     struct vehicle_state snapshot;
     struct debug_stats stats;
     bool seat_belt_open;
-    bool diagnostic_active;
-    uint8_t speed_percent;
-    uint8_t engine_percent;
+    uint32_t error_count;
+    const char *turn_text;
+    bool fault_printed = false;
 
     k_mutex_lock(&state_lock, K_FOREVER);
     snapshot = state;
@@ -462,25 +461,47 @@ static void print_debug_status(struct debug_stats *prev)
 
     seat_belt_open =
         !snapshot.left_seat_belt_fastened || !snapshot.right_seat_belt_fastened;
-    diagnostic_active = snapshot.eps_fault || snapshot.abs_fault ||
-                snapshot.motor_fault || seat_belt_open;
-    speed_percent = pulse_percent_from_value(snapshot.speed_kmh, SPEED_FULL_KMH);
-    engine_percent = pulse_percent_from_value(snapshot.engine_rpm, ENGINE_FULL_RPM);
+    error_count = stats.rx_unknown + stats.rx_bad_len;
 
-    printk("state: rx=%u(+%u) decoded=%u(+%u) unknown=%u bad_len=%u "
-           "last=ch%u id=%u len=%u\n",
-           stats.rx_total, stats.rx_total - prev->rx_total,
-           stats.rx_decoded, stats.rx_decoded - prev->rx_decoded,
-           stats.rx_unknown, stats.rx_bad_len,
-           stats.last_ch, stats.last_id, stats.last_len);
-    printk("state: speed=%ukm/h(%u%%/%uHz) engine=%urpm(%u%%/%uHz) "
-           "turn=L%u/R%u shift=%u fault=%u eps=%u abs=%u motor=%u belt_open=%u\n",
-           snapshot.speed_kmh, speed_percent, pulse_frequency_from_percent(speed_percent),
-           snapshot.engine_rpm, engine_percent, pulse_frequency_from_percent(engine_percent),
-           snapshot.left_turn, snapshot.right_turn,
-           snapshot.shift_position, diagnostic_active,
-           snapshot.eps_fault, snapshot.abs_fault,
-           snapshot.motor_fault, seat_belt_open);
+    if (snapshot.left_turn && snapshot.right_turn) {
+        turn_text = "Left|Right";
+    } else if (snapshot.left_turn) {
+        turn_text = "Left";
+    } else if (snapshot.right_turn) {
+        turn_text = "Right";
+    } else {
+        turn_text = "";
+    }
+
+    printk(ANSI_HOME);
+    printk(ANSI_CLEAR_EOL "\n" ANSI_CLEAR_EOL "\n" ANSI_CLEAR_EOL "\n"
+           ANSI_CLEAR_EOL "\n" ANSI_CLEAR_EOL "\n" ANSI_HOME);
+    printk("[Rx]: %u err=%u [Last: %u:", stats.rx_total, error_count, stats.last_id);
+    for (uint8_t i = 0U; (i < stats.last_len) && (i < ARRAY_SIZE(stats.last_data)); ++i) {
+        printk(" %02x", stats.last_data[i]);
+    }
+    printk("]" ANSI_CLEAR_EOL "\n");
+    printk("Speed = %u km/h" ANSI_CLEAR_EOL "\n", snapshot.speed_kmh);
+    printk("Engine = %u rpm" ANSI_CLEAR_EOL "\n", snapshot.engine_rpm);
+    printk("Turn = %s" ANSI_CLEAR_EOL "\n", turn_text);
+    printk("fault =");
+    if (snapshot.eps_fault) {
+        printk("%sEPS", fault_printed ? "|" : " ");
+        fault_printed = true;
+    }
+    if (snapshot.abs_fault) {
+        printk("%sABS", fault_printed ? "|" : " ");
+        fault_printed = true;
+    }
+    if (snapshot.motor_fault) {
+        printk("%sMotor", fault_printed ? "|" : " ");
+        fault_printed = true;
+    }
+    if (seat_belt_open) {
+        printk("%sBelt", fault_printed ? "|" : " ");
+    }
+    printk(ANSI_CLEAR_EOL "\n");
+    printk(ANSI_CLEAR_EOL);
 
     *prev = stats;
 }
